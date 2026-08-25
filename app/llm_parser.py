@@ -1,4 +1,5 @@
 import json
+import re
 
 import httpx
 from pydantic import BaseModel
@@ -74,6 +75,71 @@ def _call_ollama(prompt: str) -> dict:
     return json.loads(data["message"]["content"])
 
 
+def _recover_device_from_text(text: str) -> str | None:
+    """
+    Recover a device ID directly from the user's text when the
+    LLM fails to extract one.
+
+    Known registry devices are preferred. If the device is unknown,
+    a simple natural-language pattern is used so that the validator
+    can later produce the correct 'device does not exist' error.
+    """
+
+    normalized_text = text.lower()
+
+    # First prefer exact known device IDs.
+    for device_id in DEVICE_REGISTRY:
+        if device_id.lower() in normalized_text:
+            return device_id
+
+    # Fall back to common natural-language constructions such as:
+    # "pressure in reactor-core"
+    # "temperature of warehouse-3"
+    # "humidity for cold-storage-1"
+    match = re.search(
+        r"\b(?:in|of|for|from)\s+([a-zA-Z0-9][a-zA-Z0-9_-]*)",
+        normalized_text,
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def _recover_metric_from_text(text: str, device: str | None = None) -> str | None:
+    """
+    Recover a metric directly from the user's text when the LLM
+    fails to extract one.
+
+    Known metrics from the registry are preferred.
+    """
+
+    normalized_text = text.lower()
+
+    metrics: set[str] = set()
+
+    if device in DEVICE_REGISTRY:
+        metrics.update(
+            metric.lower()
+            for metric in DEVICE_REGISTRY[device]["metrics"]
+        )
+    else:
+        for info in DEVICE_REGISTRY.values():
+            metrics.update(
+                metric.lower()
+                for metric in info["metrics"]
+            )
+
+    # Prefer longer metric names first in case one metric name
+    # contains another metric name.
+    for metric in sorted(metrics, key=len, reverse=True):
+        if metric in normalized_text:
+            return metric
+
+    return None
+
+
 def extract_alert_fields(text: str) -> AlertFields:
     """
     Extract alert-rule parameters from a natural-language request.
@@ -100,10 +166,12 @@ Extract:
 - duration_minutes
 
 Rules:
-- The device MUST be one of the valid devices listed above.
-- Never invent a device name.
-- Do not use a metric name or sensor type as the device.
+
 - Extract the exact device ID mentioned by the user.
+- Do not replace a device ID with a metric name or sensor type.
+- Do not invent a device name.
+- The device does NOT need to be present in the registry.
+- Device validation is handled separately after extraction.
 - ABOVE means the value stays above the threshold.
 - BELOW means the value stays below the threshold.
 - EQUALS means the value equals the threshold.
@@ -147,12 +215,37 @@ User request:
 
     result = _call_ollama(prompt)
 
+    # If the LLM fails to identify the device, recover it from
+    # the original user text before Pydantic validation.
+    if not result.get("device"):
+        recovered_device = _recover_device_from_text(text)
+
+        if recovered_device:
+            result["device"] = recovered_device
+
+    # Recover the metric if the LLM omitted it.
+    if not result.get("metric"):
+        recovered_metric = _recover_metric_from_text(
+            text,
+            result.get("device"),
+        )
+
+        if recovered_metric:
+            result["metric"] = recovered_metric
+
     return AlertFields.model_validate(result)
 
 
 def extract_status_fields(text: str) -> StatusFields:
     """
     Extract device and metric from a status-query request.
+
+    The LLM performs the primary extraction. If it returns null
+    for a device or metric, deterministic extraction from the
+    original text is used as a fallback.
+
+    Unknown devices are intentionally preserved so that the
+    validator can return a clean registry validation error.
     """
 
     registry = _registry_description()
@@ -164,16 +257,19 @@ monitoring requests.
 {registry}
 
 Important rules:
-- The device MUST be one of the valid devices listed above.
-- Never invent a device name.
-- Do not use a metric name or sensor type as the device.
+
 - Extract the exact device ID mentioned by the user.
+- Do not use a metric name or sensor type as the device.
+- Do not invent a device name.
+- The device does NOT need to be present in the registry.
+- If the user mentions an unknown device, still extract that exact
+  device ID. Device validation happens separately.
 - Extract the metric requested by the user.
 - If no metric is specified, use null.
 - Return JSON only.
 - Do not add explanations.
 
-Example:
+Example 1:
 User: "what is the humidity in cold-storage-1 right now?"
 
 Output:
@@ -182,11 +278,39 @@ Output:
     "metric": "humidity"
 }}
 
+Example 2:
+User: "what is the pressure in reactor-core right now?"
+
+Output:
+{{
+    "device": "reactor-core",
+    "metric": "pressure"
+}}
+
 User request:
 {text}
 """
 
     result = _call_ollama(prompt)
+
+    # Primary fallback: recover the device directly from the
+    # original user request.
+    if not result.get("device"):
+        recovered_device = _recover_device_from_text(text)
+
+        if recovered_device:
+            result["device"] = recovered_device
+
+    # Secondary fallback: recover the metric directly from the
+    # original user request.
+    if not result.get("metric"):
+        recovered_metric = _recover_metric_from_text(
+            text,
+            result.get("device"),
+        )
+
+        if recovered_metric:
+            result["metric"] = recovered_metric
 
     return StatusFields.model_validate(result)
 
@@ -206,8 +330,10 @@ Determine whether the user is asking for monitoring or alert rules.
 Extract the device if one is mentioned.
 
 Rules:
-- The device MUST be one of the valid devices listed above.
-- Never invent a device name.
+
+- Extract the exact device ID mentioned by the user.
+- Do not invent a device name.
+- The device does NOT need to be present in the registry.
 - If no device is mentioned, use null.
 - Return JSON only.
 - Do not add explanations.
@@ -222,6 +348,12 @@ User request:
 """
 
     result = _call_ollama(prompt)
+
+    if not result.get("device"):
+        recovered_device = _recover_device_from_text(text)
+
+        if recovered_device:
+            result["device"] = recovered_device
 
     return ListRulesFields.model_validate(result)
 
