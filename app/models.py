@@ -38,3 +38,16 @@ Action = Annotated[
     ],
     Field(discriminator="type"),
 ]
+
+
+class ActionPlan(BaseModel):
+    """
+    Represents one or more actions extracted from a single
+    natural-language user request.
+
+    A user may express multiple operations in one request.
+    Each resulting action is independently resolved, validated,
+    and executed by the service layer.
+    """
+
+    actions: list[Action]

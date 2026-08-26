@@ -35,6 +35,22 @@ MOCK_SENSOR_DATA = {
         "temperature": 28.0,
         "occupancy": 7,
     },
+
+    # Real-world style asset mock data for the upgraded
+    # Asset -> Sensor -> Parameter model.
+    "tipper-101": {
+        "hydraulic_temperature": 72.5,
+        "hydraulic_pressure": 185.0,
+        "engine_temperature": 91.0,
+        "oil_temperature": 87.5,
+        "engine_pressure": 42.0,
+    },
+    "concrete-mixer-101": {
+        "engine_temperature": 88.0,
+        "oil_temperature": 82.5,
+        "hydraulic_temperature": 69.0,
+        "hydraulic_pressure": 172.0,
+    },
 }
 
 

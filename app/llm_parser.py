@@ -4,6 +4,7 @@ import re
 import httpx
 from pydantic import BaseModel
 
+from app.models import ActionPlan
 from app.registry import DEVICE_REGISTRY
 
 
@@ -107,7 +108,10 @@ def _recover_device_from_text(text: str) -> str | None:
     return None
 
 
-def _recover_metric_from_text(text: str, device: str | None = None) -> str | None:
+def _recover_metric_from_text(
+    text: str,
+    device: str | None = None,
+) -> str | None:
     """
     Recover a metric directly from the user's text when the LLM
     fails to extract one.
@@ -138,6 +142,295 @@ def _recover_metric_from_text(text: str, device: str | None = None) -> str | Non
             return metric
 
     return None
+
+
+def extract_action_plan(text: str) -> ActionPlan:
+    """
+    Decompose a natural-language request into one or more
+    structured actions.
+
+    The LLM performs action decomposition only. The resulting
+    actions are still treated as untrusted input and must pass
+    deterministic resolution and validation before execution.
+    """
+
+    registry = _registry_description()
+
+    prompt = f"""
+You are an action-planning parser for a smart-facility monitoring
+system.
+
+Your task is to convert ONE natural-language user request into
+ONE OR MORE structured actions.
+
+{registry}
+
+SUPPORTED ACTION TYPES:
+
+1. QUERY_STATUS
+
+Required fields:
+- type = "QUERY_STATUS"
+- device_id
+- metric
+
+Example:
+"what is the temperature in warehouse-3?"
+
+Output:
+{{
+    "type": "QUERY_STATUS",
+    "device_id": "warehouse-3",
+    "metric": "temperature"
+}}
+
+2. CREATE_ALERT_RULE
+
+Required fields:
+- type = "CREATE_ALERT_RULE"
+- device_id
+- metric
+- condition
+- threshold
+- duration_minutes
+- notify_via
+
+Allowed conditions:
+- ABOVE
+- BELOW
+- EQUALS
+
+Allowed notification methods:
+- EMAIL
+- SMS
+- PUSH
+
+Example:
+"alert me if warehouse-3 temperature goes above 40"
+
+Output:
+{{
+    "type": "CREATE_ALERT_RULE",
+    "device_id": "warehouse-3",
+    "metric": "temperature",
+    "condition": "ABOVE",
+    "threshold": 40,
+    "duration_minutes": 0,
+    "notify_via": ["EMAIL"]
+}}
+
+3. LIST_RULES
+
+Required fields:
+- type = "LIST_RULES"
+- device_id
+
+Example:
+"show me the alert rules for warehouse-3"
+
+Output:
+{{
+    "type": "LIST_RULES",
+    "device_id": "warehouse-3"
+}}
+
+4. UNSUPPORTED
+
+Required fields:
+- type = "UNSUPPORTED"
+- reason
+
+Use this when the request does not represent a supported
+monitoring operation.
+
+CRITICAL EXTRACTION RULES:
+
+- Return an "actions" array.
+- Every explicitly requested independent operation must become
+  a separate action.
+- A single user request may contain multiple actions.
+- Do not combine independent status queries into one action.
+- Do not combine independent alert rules into one action.
+
+ONLY EXTRACT EXPLICITLY REQUESTED ACTIONS:
+
+- Only create an action when the user explicitly requests it.
+- Do NOT infer an additional metric from context.
+- Do NOT infer an additional sensor from context.
+- Do NOT infer an additional status query.
+- Do NOT infer an additional alert rule.
+- Do NOT infer that "its" refers to another metric.
+- Do NOT create actions for information that the user did not ask for.
+- If the user asks for temperature only, create only a temperature
+  action.
+- If the user explicitly asks for temperature AND humidity, create
+  both actions.
+- If the user asks for temperature AND alert rules, create exactly
+  those two actions.
+- Do not assume that an asset having multiple metrics means that
+  all metrics should be queried.
+
+DEVICE AND METRIC RULES:
+
+- Preserve the exact device ID mentioned by the user.
+- Do not invent device IDs.
+- Preserve the metric or parameter concept explicitly expressed
+  by the user.
+- Do not invent a metric.
+- Device and metric validation happens separately after extraction.
+
+ACTION SEMANTICS:
+
+- QUERY_STATUS means the user explicitly asks for the current
+  value or status of a metric.
+- LIST_RULES means the user explicitly asks to see, list, or show
+  monitoring or alert rules.
+- CREATE_ALERT_RULE means the user explicitly asks to create,
+  configure, or receive an alert when a condition occurs.
+- UNSUPPORTED means the request does not represent a supported
+  monitoring operation.
+
+IMPORTANT:
+
+- Do not execute anything.
+- Do not validate whether a device exists.
+- Do not validate whether a metric exists.
+- Do not choose between ambiguous parameters.
+- Do not add explanations outside the JSON.
+- Return JSON only.
+
+MULTI-ACTION EXAMPLE 1:
+
+User:
+"What is the temperature and humidity in warehouse-3?"
+
+Output:
+{{
+    "actions": [
+        {{
+            "type": "QUERY_STATUS",
+            "device_id": "warehouse-3",
+            "metric": "temperature"
+        }},
+        {{
+            "type": "QUERY_STATUS",
+            "device_id": "warehouse-3",
+            "metric": "humidity"
+        }}
+    ]
+}}
+
+MULTI-ACTION EXAMPLE 2:
+
+User:
+"Check the temperature of warehouse-3 and show me its alert rules."
+
+Output:
+{{
+    "actions": [
+        {{
+            "type": "QUERY_STATUS",
+            "device_id": "warehouse-3",
+            "metric": "temperature"
+        }},
+        {{
+            "type": "LIST_RULES",
+            "device_id": "warehouse-3"
+        }}
+    ]
+}}
+
+IMPORTANT:
+Do NOT create a humidity QUERY_STATUS action because humidity
+was not explicitly requested.
+
+MULTI-ACTION EXAMPLE 3:
+
+User:
+"Create a temperature alert for warehouse-3 above 40 and
+a humidity alert for warehouse-3 below 30."
+
+Output:
+{{
+    "actions": [
+        {{
+            "type": "CREATE_ALERT_RULE",
+            "device_id": "warehouse-3",
+            "metric": "temperature",
+            "condition": "ABOVE",
+            "threshold": 40,
+            "duration_minutes": 0,
+            "notify_via": ["EMAIL"]
+        }},
+        {{
+            "type": "CREATE_ALERT_RULE",
+            "device_id": "warehouse-3",
+            "metric": "humidity",
+            "condition": "BELOW",
+            "threshold": 30,
+            "duration_minutes": 0,
+            "notify_via": ["EMAIL"]
+        }}
+    ]
+}}
+
+If the request contains only one supported operation, return
+one action in the actions array.
+
+User request:
+{text}
+"""
+
+    result = _call_ollama(prompt)
+
+    # Protect against an unexpected null/missing actions field.
+    if not result.get("actions"):
+        result["actions"] = [
+            {
+                "type": "UNSUPPORTED",
+                "reason": (
+                    "The request could not be converted into a "
+                    "supported monitoring action."
+                ),
+            }
+        ]
+
+    # Recover missing device IDs and metrics for individual actions.
+    #
+    # These deterministic fallbacks are only used when the LLM
+    # fails to extract a value. They do not override a value that
+    # the LLM has already extracted.
+    for action in result["actions"]:
+        if not isinstance(action, dict):
+            continue
+
+        action_type = action.get("type")
+
+        if action_type in {
+            "QUERY_STATUS",
+            "CREATE_ALERT_RULE",
+            "LIST_RULES",
+        }:
+            if not action.get("device_id"):
+                recovered_device = _recover_device_from_text(text)
+
+                if recovered_device:
+                    action["device_id"] = recovered_device
+
+            if action_type in {
+                "QUERY_STATUS",
+                "CREATE_ALERT_RULE",
+            }:
+                if not action.get("metric"):
+                    recovered_metric = _recover_metric_from_text(
+                        text,
+                        action.get("device_id"),
+                    )
+
+                    if recovered_metric:
+                        action["metric"] = recovered_metric
+
+    return ActionPlan.model_validate(result)
 
 
 def extract_alert_fields(text: str) -> AlertFields:

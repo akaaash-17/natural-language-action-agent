@@ -1,12 +1,17 @@
 def route_intent(text: str) -> str:
     """
-    Determine the high-level action requested by the user.
+    Determine the high-level processing path requested by the user.
 
     Returns one of:
     - CREATE_ALERT_RULE
     - QUERY_STATUS
     - LIST_RULES
+    - MULTI_ACTION
     - UNSUPPORTED
+
+    The router is intentionally deterministic and lightweight.
+    It does not call the LLM. The LLM is only used later when
+    structured action extraction is required.
     """
 
     text_lower = text.lower().strip()
@@ -27,6 +32,21 @@ def route_intent(text: str) -> str:
 
     if any(phrase in text_lower for phrase in unsupported_phrases):
         return "UNSUPPORTED"
+
+    # Detect requests that contain multiple explicit operations.
+    #
+    # These are intentionally conservative signals. The actual
+    # decomposition is performed by the ActionPlan LLM parser.
+    multi_action_patterns = [
+        " and ",
+        " as well as ",
+        " along with ",
+        " also ",
+        " plus ",
+    ]
+
+    if any(pattern in text_lower for pattern in multi_action_patterns):
+        return "MULTI_ACTION"
 
     # Requests to inspect existing rules.
     list_rule_phrases = [
