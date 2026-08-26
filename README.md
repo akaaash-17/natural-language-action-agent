@@ -1,18 +1,14 @@
 # Natural Language Action Agent
 
-A small, local LLM-powered backend that converts natural-language smart-facility requests into **typed, validated, executable actions**.
+A local LLM-powered backend that converts natural-language smart-facility requests into **typed, validated, executable actions**.
 
-The core design principle is simple:
+> **Core principle:** Use the LLM for language understanding, but keep validation, business rules, safety, and execution deterministic.
 
-> **Use the LLM for language understanding, but do not trust the LLM with validation, safety, or execution.**
+The system accepts requests such as:
 
-The service accepts plain-English requests such as:
+> "Create a temperature alert for warehouse-3 above 40 and a humidity alert for warehouse-3 below 30."
 
-> "Alert me if warehouse-3 temperature stays above 40 degrees for more than 10 minutes."
-
-It turns the request into a structured action, validates that the device and metric actually exist in the mock facility registry, and then executes supported actions against deterministic mock data.
-
-The project uses **FastAPI + Ollama + Llama 3.2 + Pydantic**, with an in-memory rule store.
+It can decompose that request into multiple typed actions, resolve asset-specific parameters, validate each action independently, and execute only valid actions against deterministic mock data.
 
 ---
 
@@ -20,13 +16,13 @@ The project uses **FastAPI + Ollama + Llama 3.2 + Pydantic**, with an in-memory 
 
 Smart-facility systems normally expose structured operations such as:
 
-- create an alert rule
-- query the current status of a device
-- list existing alert rules
+- Create an alert rule
+- Query the current status of a device
+- List existing alert rules
 
 Those operations are easy for software to represent but less convenient for humans to express.
 
-Instead of forcing an operator to provide JSON such as:
+Instead of requiring JSON like:
 
 ```json
 {
@@ -40,13 +36,11 @@ Instead of forcing an operator to provide JSON such as:
 }
 ```
 
-the user can simply say:
+the user can simply write:
 
 > "Alert me if warehouse-3 temperature stays above 40 degrees for more than 10 minutes."
 
-The agent handles the translation from natural language to a structured action.
-
-The important part is that the generated action is **not executed blindly**. The application validates it against its own rules first.
+The application translates the natural-language request into structured actions and then validates those actions before execution.
 
 ---
 
@@ -61,78 +55,188 @@ The important part is that the generated action is **not executed blindly**. The
 | `LIST_RULES` | "Show existing alert rules" | Returns stored rules |
 | `UNSUPPORTED` | "Turn off the cooling system" | Safely rejects the request |
 
-### Mock device registry
+### Multi-action requests
 
-The current registry contains:
+The system also supports multiple operations in a single natural-language request.
 
-- `warehouse-3` → temperature, humidity
-- `cold-storage-1` → temperature, humidity
-- `front-gate` → camera_status, occupancy
-- `server-room-1` → temperature, humidity
-- `production-floor-1` → temperature, humidity, occupancy
-- `loading-bay-1` → temperature, occupancy
+For example:
 
-The registry is deliberately small and deterministic because this is a take-home exercise rather than a real facility integration.
+```text
+What is the temperature and humidity in warehouse-3?
+```
+
+becomes:
+
+```text
+QUERY_STATUS → temperature
+QUERY_STATUS → humidity
+```
+
+Another example:
+
+```text
+Check the temperature of warehouse-3 and show me its alert rules.
+```
+
+becomes:
+
+```text
+QUERY_STATUS → temperature
+LIST_RULES → warehouse-3
+```
+
+A mixed alert request can also be decomposed:
+
+```text
+Create a temperature alert for warehouse-3 above 40
+and a humidity alert for warehouse-3 below 30.
+```
+
+becomes two independent `CREATE_ALERT_RULE` actions.
+
+Each action is resolved, validated, and executed independently. Therefore, one invalid action does not prevent other actions from being evaluated.
 
 ---
 
-## 3. Architecture
+## 3. Asset → Sensor → Parameter resolution
+
+One of the important extensions in the project is support for assets that contain multiple sensors and parameters.
+
+For example:
+
+```text
+tipper-101
+├── hydraulic sensor
+│   ├── hydraulic_temperature
+│   └── hydraulic_pressure
+│
+└── engine sensor
+    ├── engine_temperature
+    └── oil_temperature
+```
+
+The user does not always provide the exact backend parameter name.
+
+### Exact parameter
+
+```text
+What is the hydraulic temperature in tipper-101 right now?
+```
+
+resolves to:
+
+```text
+hydraulic_temperature
+```
+
+### Ambiguous concept
+
+```text
+What is the temperature in tipper-101 right now?
+```
+
+can match:
+
+```text
+hydraulic_temperature
+engine_temperature
+oil_temperature
+```
+
+The system therefore rejects the request as ambiguous and asks the user to specify the parameter instead of guessing.
+
+### Unknown parameter
+
+```text
+What is the battery voltage in tipper-101?
+```
+
+returns a clean validation error because `battery_voltage` is not registered for that asset.
+
+This resolution layer is deterministic and sits between LLM extraction and execution.
+
+---
+
+## 4. Current mock registry
+
+The original facility registry contains:
+
+```text
+warehouse-3        → temperature, humidity
+cold-storage-1    → temperature, humidity
+front-gate        → camera_status, occupancy
+server-room-1     → temperature, humidity
+production-floor-1 → temperature, humidity, occupancy
+loading-bay-1     → temperature, occupancy
+```
+
+The asset/parameter resolver additionally demonstrates the more realistic multi-sensor structure using `tipper-101`.
+
+The registry is intentionally small and deterministic because this is an assessment project rather than a real IoT integration.
+
+---
+
+## 5. Architecture
 
 ```text
                          User
                           |
                           v
-                 +----------------+
-                 |    FastAPI     |
-                 |    /command    |
-                 |     /rules     |
-                 +-------+--------+
-                         |
-                         v
-                 +----------------+
-                 | Intent Router  |
-                 | deterministic  |
-                 +-------+--------+
-                         |
-             +-----------+-----------+
-             |                       |
-             v                       v
-       Known intent            Unsupported/
-             |                  ambiguous
-             v                       |
-     +----------------+              |
-     | Ollama /       |              |
-     | Llama 3.2      |              |
-     | field extraction|             |
-     +-------+--------+              |
-             |                       |
-             v                       |
-     +----------------+              |
-     | Pydantic       |              |
-     | typed models   |              |
-     +-------+--------+              |
-             |                       |
-             v                       |
-     +----------------+              |
-     | Validator      |              |
-     | device/metric  |              |
-     | checks         |              |
-     +-------+--------+              |
-             |
-       +-----+------+
-       |            |
-       v            v
-     Valid        Invalid
-       |            |
-       v            v
-   Executor      HTTP 422
-       |
-       v
-+----------------------+
-| In-memory Store /    |
-| Deterministic Mock   |
-| Sensors              |
-+----------------------+
+                  +----------------+
+                  |    FastAPI     |
+                  | /command       |
+                  | /rules         |
+                  +-------+--------+
+                          |
+                          v
+                  +----------------+
+                  | Intent Router  |
+                  | deterministic  |
+                  +-------+--------+
+                          |
+                +---------+---------+
+                |                   |
+         Single Intent        MULTI_ACTION
+                |                   |
+                +---------+---------+
+                          |
+                          v
+                  +----------------+
+                  | Ollama         |
+                  | Llama 3.2      |
+                  | JSON extraction|
+                  +-------+--------+
+                          |
+                          v
+                  +----------------+
+                  | Typed Pydantic |
+                  | Action / Plan  |
+                  +-------+--------+
+                          |
+                          v
+                  +----------------+
+                  | Parameter      |
+                  | Resolver       |
+                  +-------+--------+
+                          |
+                          v
+                  +----------------+
+                  | Validator      |
+                  | Registry checks|
+                  +-------+--------+
+                          |
+                    +-----+-----+
+                    |           |
+                  Valid       Invalid
+                    |           |
+                    v           v
+                Executor    Safe error
+                    |
+                    v
+          +----------------------+
+          | Mock sensor data /   |
+          | in-memory rule store |
+          +----------------------+
 ```
 
 ### Request lifecycle
@@ -142,122 +246,99 @@ For a supported request:
 ```text
 Natural language
       ↓
-Intent classification
+Deterministic intent routing
       ↓
-LLM parameter extraction
+LLM action/field extraction
       ↓
-Pydantic validation
+Pydantic typed models
       ↓
-Device/metric validation
+Asset/parameter resolution
       ↓
-Mock execution
+Registry + business validation
+      ↓
+Execution
       ↓
 Structured JSON response
 ```
 
-For an invalid or unsupported request:
+For an invalid request:
 
 ```text
 Natural language
       ↓
-Intent classification
+Intent routing / LLM extraction
       ↓
-Unsupported OR invalid structured action
+Parameter or action resolution
       ↓
-Safe rejection
+Validation failure
       ↓
-Clear error/reason
+Clear error / safe rejection
 ```
 
 ---
 
-## 4. Why is this a hybrid design?
+## 6. Why is this a hybrid design?
 
 This is intentionally **not an end-to-end LLM agent**.
 
-The system uses two different mechanisms for two different jobs.
+Different responsibilities are handled by different components.
 
 ### Deterministic code handles
 
-- high-level intent routing
-- allowed action types
+- High-level intent routing
+- Action types
 - Pydantic schema validation
-- device existence
-- metric/device compatibility
-- execution
-- storage
+- Asset/device validation
+- Sensor/parameter compatibility
+- Ambiguity detection
+- Unsupported operations
+- Execution
+- Storage
 - HTTP error handling
 
 ### The LLM handles
 
-- understanding natural language
-- extracting device IDs
-- extracting metrics
-- interpreting conditions such as "above", "below", and "exceeds"
-- extracting numeric thresholds
-- extracting durations from phrases such as "for ten minutes"
+- Understanding natural language
+- Extracting asset/device IDs
+- Extracting metrics or parameter concepts
+- Interpreting conditions such as "above", "below", and "exceeds"
+- Extracting numeric thresholds
+- Extracting durations
+- Decomposing multi-action requests
 
-This separation is important because language understanding is probabilistic, while safety and business constraints should be deterministic.
-
-If the model says:
-
-```json
-{
-  "device": "reactor-core",
-  "metric": "pressure"
-}
-```
-
-the application does **not** assume that the device exists.
-
-The validator checks the registry and rejects it:
-
-```text
-Device 'reactor-core' does not exist in the device registry.
-```
-
-This is the main reliability boundary in the project.
+The LLM therefore acts as a **translator**, not the source of truth.
 
 ---
 
-## 5. Why Ollama?
+## 7. Why Ollama?
 
-I chose Ollama because the assignment explicitly allows a local LLM and the problem does not require a cloud model.
+Ollama was selected because the assignment supports local LLM inference and this task does not require a cloud model.
 
-Using Ollama provides several practical advantages for this project:
+### Advantages
 
-### 1. Completely local
+**Local inference**
 
-No paid API key or external LLM service is required.
+No external API key or cloud dependency is required.
 
-The entire language-understanding step runs locally.
+**Privacy**
 
-### 2. Easier evaluation
+Facility-related commands can remain on the local machine instead of being sent to a third-party inference provider.
 
-An evaluator can reproduce the same architecture without needing:
+**Reproducibility**
 
-- OpenAI credentials
-- Anthropic credentials
-- API billing
-- cloud configuration
+An evaluator can reproduce the architecture with Ollama and the selected model without requiring cloud credentials or billing.
 
-They only need Ollama and the selected model.
+**Simple integration**
 
-### 3. Privacy
+Ollama exposes a local HTTP API. The application sends a constrained prompt and requests JSON output.
 
-Facility commands can potentially contain operational information. Keeping inference local avoids sending those requests to a third-party API.
+**Good fit for the task**
 
-### 4. Simple integration
-
-Ollama exposes a straightforward local HTTP API. The parser sends a prompt requesting JSON and validates the returned object with Pydantic.
-
-### 5. Good fit for the assignment
-
-The assignment explicitly says a local model via Ollama is acceptable. For a small structured-extraction task, a local model is a reasonable engineering trade-off.
+The model is mainly performing structured extraction rather than complex reasoning, so local inference is a practical trade-off.
 
 ---
 
-## 6. Why Llama 3.2?
+## 8. Why Llama 3.2?
 
 The project uses:
 
@@ -267,173 +348,128 @@ llama3.2
 
 through Ollama.
 
-The task does not require a large reasoning model. The model mainly needs to perform constrained information extraction:
+The task mainly requires:
 
-- identify a device
-- identify a metric
-- identify a condition
-- extract numbers
-- extract duration
-- return JSON
+- Device/asset extraction
+- Metric/parameter extraction
+- Condition extraction
+- Threshold extraction
+- Duration extraction
+- Multi-action decomposition
+- JSON output
 
-Llama 3.2 provides a practical balance for this use case:
+A large frontier model is unnecessary for this scope.
 
-- small enough to run locally
-- capable enough for natural-language extraction
-- available directly through Ollama
-- avoids unnecessary cloud/API dependency
+Llama 3.2 provides a practical balance between local resource requirements and extraction capability.
 
-I intentionally did not optimize this project around using the newest or largest model. The objective is a **dependable action pipeline**, not maximizing model capability.
-
-The model can be replaced later without changing the validation or execution layers.
+The model can also be replaced later without changing the validation or execution layers.
 
 ---
 
-## 7. Why not let the LLM validate everything?
+## 9. Why deterministic intent routing?
 
-Because that would create an unnecessary safety dependency on probabilistic output.
+The intent router is deliberately lightweight and does not call the LLM.
 
-For example, the model could understand:
-
-> "Alert me if reactor-core pressure exceeds 9000."
-
-and produce a perfectly valid-looking JSON object.
-
-But `reactor-core` does not exist in the registry.
-
-The correct behavior is therefore:
+The current high-level routes are:
 
 ```text
-LLM → understands request
-       ↓
-structured action
-       ↓
-application validator → device does not exist
-       ↓
-HTTP 422
+CREATE_ALERT_RULE
+QUERY_STATUS
+LIST_RULES
+MULTI_ACTION
+UNSUPPORTED
 ```
 
-The LLM is therefore treated as a **translator**, not as the source of truth.
+For example:
 
-The registry and Pydantic models remain the source of truth.
+```text
+"What is the battery voltage in tipper-101?"
+```
+
+→ `QUERY_STATUS`
+
+while:
+
+```text
+"What is the temperature in warehouse-3 and
+the battery voltage in tipper-101?"
+```
+
+→ `MULTI_ACTION`
+
+This saves an unnecessary LLM call for high-level classification and makes the safety boundaries predictable.
+
+The LLM is used after routing, where language understanding provides the most value: extracting the structured details.
 
 ---
 
-## 8. Prompt design
+## 10. Multi-action processing
 
-The extraction prompts are intentionally constrained.
+For a multi-action request, the flow is:
 
-The prompts provide the model with:
+```text
+User request
+     ↓
+MULTI_ACTION router
+     ↓
+ActionPlan extraction
+     ↓
+Individual typed actions
+     ↓
+Resolve each action
+     ↓
+Validate each action
+     ↓
+Execute valid actions
+     ↓
+Return per-action results
+```
 
-1. the valid device registry
-2. the expected fields
-3. explicit extraction rules
-4. examples
-5. an instruction to return JSON only
+Example:
 
-For example, the alert extraction prompt tells the model:
+```text
+What is the temperature and battery voltage in tipper-101?
+```
 
-- never invent a device
-- use an exact device ID from the registry
-- do not confuse a metric/sensor with a device
-- map "above" to `ABOVE`
-- map "below" to `BELOW`
-- convert durations such as "more than 10 minutes"
-- return `null` when an event condition has no numeric threshold
-- return JSON only
+can produce:
 
-The returned JSON is then parsed and validated with Pydantic.
+```text
+Action 1:
+QUERY_STATUS
+temperature
+→ AMBIGUOUS
 
-This gives us a second validation boundary after the model itself.
+Action 2:
+QUERY_STATUS
+battery_voltage
+→ UNKNOWN
+```
+
+The response reports both failures independently rather than crashing the entire request.
+
+This is important because multi-action requests should have **partial failure isolation**.
 
 ---
 
-## 9. Handling ambiguity: the camera-offline case
-
-One of the required assignment cases is:
-
-> "notify security if the front-gate camera goes offline"
-
-This is intentionally different from a normal numeric alert.
-
-A normal supported alert looks like:
-
-```text
-temperature > 40 for 10 minutes
-```
-
-The current action schema is based on numeric threshold conditions:
-
-```text
-ABOVE
-BELOW
-EQUALS
-```
-
-A camera going offline is an **event/state condition**, not a numeric threshold.
-
-The LLM can understand the request:
-
-```json
-{
-  "device": "front-gate",
-  "metric": "camera_status",
-  "condition": "OFFLINE",
-  "threshold": null,
-  "duration_minutes": null
-}
-```
-
-but the service deliberately does not execute that action.
-
-Instead it returns:
-
-```json
-{
-  "type": "UNSUPPORTED"
-}
-```
-
-with a reason explaining that the current alert implementation requires a numeric threshold.
-
-### Why this decision?
-
-I preferred a safe rejection over inventing semantics for an action that the current backend does not support.
-
-With more time, the action model could be extended with explicit event-based rules such as:
-
-```text
-condition: OFFLINE
-```
-
-but that is outside the current implementation scope.
-
----
-
-## 10. Validation and safety
+## 11. Validation and safety
 
 Validation happens after LLM extraction.
 
 ### Device validation
 
-The device must exist in `DEVICE_REGISTRY`.
+An unknown asset/device is rejected.
 
-Unknown device:
-
-```text
-reactor-core
-```
-
-results in:
+Example:
 
 ```text
-422 VALIDATION_ERROR
-Device 'reactor-core' does not exist in the device registry.
+Alert me if reactor-core pressure exceeds 9000.
 ```
 
-### Metric validation
+results in a validation error because `reactor-core` is not registered.
 
-The metric must be supported by the specific device.
+### Parameter validation
+
+A parameter must belong to the requested asset.
 
 For example:
 
@@ -443,39 +479,93 @@ warehouse-3 → humidity ✓
 warehouse-3 → pressure ✗
 ```
 
-An unsupported metric is rejected rather than silently executed.
+### Ambiguity validation
+
+If a broad concept maps to multiple parameters, the system refuses to guess.
+
+Example:
+
+```text
+temperature
+```
+
+on `tipper-101` maps to:
+
+```text
+hydraulic_temperature
+engine_temperature
+oil_temperature
+```
+
+Therefore:
+
+```text
+Multiple parameters match 'temperature'...
+Please specify which parameter you want.
+```
 
 ### Physical control
 
-The system does not directly control physical equipment.
+The current system does not directly control physical equipment.
 
 Requests such as:
 
-> "Turn off the cooling system in warehouse-3."
+```text
+Turn off the cooling system in warehouse-3.
+```
 
-are returned as:
+are rejected as:
 
-```json
-{
-  "type": "UNSUPPORTED"
-}
+```text
+UNSUPPORTED
 ```
 
 No physical action is attempted.
 
 ---
 
-## 11. Mock execution model
+## 12. Camera-offline handling
 
-There is deliberately no real database or physical hardware integration.
+A required edge case is:
 
-The assignment asks for a mock backend, so the implementation uses:
+> "Notify security if the front-gate camera goes offline."
 
-- deterministic mock sensor values
-- an in-memory rule store
-- no external database
+This differs from the current numeric threshold model.
 
-For example, a status query can return:
+Supported numeric conditions are:
+
+```text
+ABOVE
+BELOW
+EQUALS
+```
+
+A camera going offline is an event/state condition rather than a numeric threshold.
+
+The LLM can understand the request, but the service intentionally does not execute it.
+
+Instead it returns:
+
+```text
+UNSUPPORTED
+```
+
+with a reason explaining that the current alert implementation requires a numeric threshold.
+
+This is a deliberate safety decision: **reject unsupported semantics instead of inventing backend behavior.**
+
+---
+
+## 13. Mock execution model
+
+The project intentionally uses:
+
+- Deterministic mock sensor values
+- An in-memory alert-rule store
+- No external database
+- No physical hardware
+
+Example status response:
 
 ```json
 {
@@ -486,25 +576,25 @@ For example, a status query can return:
 }
 ```
 
-Creating an alert appends the validated rule to the in-memory store.
+Creating an alert stores the validated rule in memory.
 
-The rules can then be queried through:
+The rules can then be retrieved through:
 
 ```text
 GET /rules
 ```
 
-The store lasts for the lifetime of the application process.
+The store lasts only for the lifetime of the application process.
 
 ---
 
-## 12. API
+## 14. API
 
 ### `GET /`
 
 Health check.
 
-Example response:
+Example:
 
 ```json
 {
@@ -523,31 +613,9 @@ Request:
 }
 ```
 
-Example response:
-
-```json
-{
-  "success": true,
-  "input": "Alert me if warehouse-3 temperature stays above 40 degrees for more than 10 minutes.",
-  "action": {
-    "type": "CREATE_ALERT_RULE",
-    "device_id": "warehouse-3",
-    "metric": "temperature",
-    "condition": "ABOVE",
-    "threshold": 40,
-    "duration_minutes": 10,
-    "notify_via": ["EMAIL"]
-  },
-  "result": {
-    "success": true,
-    "message": "Alert rule created successfully."
-  }
-}
-```
-
 ### `GET /rules`
 
-Returns all stored alert rules.
+Returns stored alert rules.
 
 Optional filter:
 
@@ -555,9 +623,19 @@ Optional filter:
 GET /rules?device_id=warehouse-3
 ```
 
+### Swagger UI
+
+When the server is running:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+This provides interactive API testing.
+
 ---
 
-## 13. Setup
+## 15. Setup
 
 ### Prerequisites
 
@@ -566,20 +644,20 @@ GET /rules?device_id=warehouse-3
 - Llama 3.2
 - Git
 
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/akaaash-17/natural-language-action-agent.git
 cd natural-language-action-agent
 ```
 
-### 2. Create a virtual environment
+### 2. Create virtual environment
 
 Windows PowerShell:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 ```
 
 ### 3. Install dependencies
@@ -588,15 +666,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 4. Install/start Ollama
-
-Verify:
+### 4. Verify Ollama
 
 ```powershell
 ollama --version
 ```
 
-Pull the model if necessary:
+Pull the model if required:
 
 ```powershell
 ollama pull llama3.2
@@ -614,13 +690,7 @@ ollama list
 uvicorn app.main:app --reload
 ```
 
-The API will be available at:
-
-```text
-http://127.0.0.1:8000
-```
-
-Interactive API documentation:
+Then open:
 
 ```text
 http://127.0.0.1:8000/docs
@@ -628,7 +698,7 @@ http://127.0.0.1:8000/docs
 
 ---
 
-## 14. Running tests
+## 16. Testing
 
 Run:
 
@@ -636,136 +706,141 @@ Run:
 pytest -v
 ```
 
-The project currently contains automated coverage for:
-
-1. root/health endpoint
-2. empty commands
-3. malformed request bodies
-4. valid alert creation
-5. status queries
-6. unsupported commands
-7. validation errors
-8. empty rules endpoint
-9. stored rules
-10. rules filtering
-11. front-gate camera-offline handling
-
-Latest local verification:
+Current automated suite:
 
 ```text
-11 passed
+16 passed
 ```
 
-The required assignment cases are therefore covered by automated tests, not only manual Swagger/cURL checks.
+The tests cover:
+
+1. Root/health endpoint
+2. Empty command
+3. Invalid request format
+4. Alert creation
+5. Status queries
+6. Unsupported commands
+7. Validation errors
+8. Empty rules endpoint
+9. Stored rules
+10. Rules filtering
+11. Front-gate camera-offline handling
+12. Multiple status queries in one request
+13. Mixed multi-intent requests
+14. Multiple alert rules in one request
+15. Ambiguous parameter rejection
+16. Unknown parameter rejection
+
+The LLM layer is mocked where appropriate in API tests so the test suite remains deterministic and does not require Ollama for every test.
 
 ---
 
-## 15. Example scenarios
+## 17. Example scenarios
 
-### Create an alert
-
-Input:
+### Single action
 
 ```text
 Alert me if warehouse-3 temperature stays above 40 degrees for more than 10 minutes.
 ```
 
-Expected:
+→ `CREATE_ALERT_RULE`
+
+### Multiple metrics
 
 ```text
-CREATE_ALERT_RULE
+What is the temperature and humidity in warehouse-3?
 ```
 
-### Query status
-
-Input:
+→
 
 ```text
-Could you please tell me the temperature at warehouse-3 right now?
+QUERY_STATUS → temperature
+QUERY_STATUS → humidity
 ```
 
-Expected:
+### Mixed intents
 
 ```text
-QUERY_STATUS
+Check the temperature of warehouse-3 and show me its alert rules.
 ```
 
-### Query another metric
-
-Input:
-
-```text
-What is the humidity in cold-storage-1 right now?
-```
-
-Expected:
+→
 
 ```text
 QUERY_STATUS
+LIST_RULES
 ```
 
-### Invalid device
-
-Input:
+### Multiple alert rules
 
 ```text
-Alert me if reactor-core pressure exceeds 9000.
+Create a temperature alert for warehouse-3 above 40
+and a humidity alert for warehouse-3 below 30.
 ```
 
-Expected:
+→
 
 ```text
-HTTP 422
-Device 'reactor-core' does not exist in the device registry.
+CREATE_ALERT_RULE → temperature > 40
+CREATE_ALERT_RULE → humidity < 30
 ```
+
+### Ambiguous parameter
+
+```text
+What is the temperature in tipper-101?
+```
+
+→ Rejected because multiple registered parameters match:
+
+```text
+hydraulic_temperature
+engine_temperature
+oil_temperature
+```
+
+### Unknown parameter
+
+```text
+What is the battery voltage in tipper-101?
+```
+
+→ Rejected because the parameter is not registered.
 
 ### Unsupported physical control
-
-Input:
 
 ```text
 Turn off the cooling system in warehouse-3.
 ```
 
-Expected:
-
-```text
-UNSUPPORTED
-```
+→ `UNSUPPORTED`
 
 ### Event-based alert
-
-Input:
 
 ```text
 Notify security if the front-gate camera goes offline.
 ```
 
-Expected:
-
-```text
-UNSUPPORTED
-```
-
-because event-based camera state alerts are outside the current numeric-threshold alert model.
+→ `UNSUPPORTED`
 
 ---
 
-## 16. Project structure
+## 18. Project structure
 
 ```text
 natural-language-action-agent/
 │
 ├── app/
 │   ├── executor.py       # Executes validated actions
-│   ├── llm_parser.py     # Ollama/Llama 3.2 extraction
-│   ├── main.py           # FastAPI application and endpoints
-│   ├── models.py         # Pydantic action models
-│   ├── registry.py       # Mock device/metric registry
-│   ├── router.py         # Deterministic intent routing
-│   ├── service.py        # Orchestration layer
-│   ├── store.py          # In-memory alert-rule store
-│   └── validator.py      # Device/metric/action validation
+│   ├── llm_parser.py     # Ollama/Llama 3.2 extraction + action planning
+│   ├── main.py            # FastAPI application and endpoints
+│   ├── models.py          # Pydantic action models
+│   ├── registry.py        # Mock device/metric registry
+│   ├── resolver.py        # Asset/parameter resolution
+│   ├── router.py          # Deterministic intent routing
+│   ├── service.py         # Orchestration layer
+│   ├── store.py           # In-memory alert-rule store
+│   └── validator.py       # Device/metric/action validation
 │
 ├── tests/
 │   ├── __init__.py
@@ -778,151 +853,248 @@ natural-language-action-agent/
 
 ---
 
-## 17. Design decisions
+## 19. Important design decisions
 
 ### LLM as translator, not controller
 
-The LLM's job ends after producing structured information.
+The LLM's responsibility ends after producing structured information.
 
 It does not:
 
-- decide whether a device exists
-- bypass validation
-- access the store directly
-- control hardware
-- decide whether an action is safe to execute
+- Decide whether a device exists
+- Bypass validation
+- Access the store directly
+- Control hardware
+- Decide whether an unsupported operation should be executed
 
 ### Deterministic validation
 
 The application owns the actual constraints.
 
-This makes behavior easier to test and reason about.
+This makes behavior easier to test, reason about, and secure.
+
+### Multi-action isolation
+
+Each action in an `ActionPlan` is independently resolved, validated, and executed.
+
+One bad action does not automatically invalidate unrelated actions.
+
+### Asset-aware parameter resolution
+
+Broad concepts such as "temperature" are resolved against the selected asset's registered parameters.
+
+The system does not silently choose one when several parameters match.
 
 ### In-memory backend
 
-A real database would add infrastructure without adding meaningful value for this assignment.
-
-The in-memory store demonstrates the required create-and-query workflow while keeping the implementation small.
-
-### Local inference
-
-Ollama removes external API dependencies and makes the project easy to reproduce locally.
+A real database would add infrastructure without adding meaningful value for this assessment.
 
 ### Conservative unsupported behavior
 
-When the system cannot map a request into a supported action safely, it rejects the request rather than guessing.
+When the backend does not model an operation safely, the system rejects it instead of guessing.
 
 ---
 
-## 18. Known limitations
+## 20. Known limitations
 
-This is intentionally a small assessment project rather than a production monitoring platform.
+This is an assessment project rather than a production monitoring platform.
 
 Current limitations include:
 
-1. **Only a small mock device registry is available.**
-2. **Alert rules currently use numeric threshold conditions.**
-3. **Event/state alerts such as camera-offline are not executed.**
-4. **Physical device control is explicitly unsupported.**
-5. **Alert notification output currently defaults to `EMAIL`.** The action schema supports `EMAIL`, `SMS`, and `PUSH`, but the current service path uses email as the default.
-6. **Rules are stored only in memory**, so they disappear when the process stops.
-7. **The system depends on a locally running Ollama model.**
-8. **Natural-language coverage is intentionally limited to a reasonable subset rather than every possible phrasing.**
-9. **The intent router is deterministic rather than LLM-based, which improves predictability but means completely novel intent wording may fall back to `UNSUPPORTED`.**
+1. The mock registry is intentionally small.
+2. Alert rules currently use numeric threshold conditions.
+3. Event/state alerts such as camera-offline are not executed.
+4. Physical device control is explicitly unsupported.
+5. Notification output currently defaults to `EMAIL`.
+6. Rules are stored only in memory and disappear when the process stops.
+7. The application depends on a locally running Ollama model.
+8. Natural-language coverage is intentionally limited to a practical subset.
+9. The deterministic router may classify completely novel phrasing as `UNSUPPORTED`.
+10. The mock sensor backend is not connected to real-time telemetry.
 
-These are deliberate scope decisions rather than attempts to simulate a production IoT platform.
-
----
-
-## 19. What I would improve with more time
-
-If this were moved toward production, I would prioritize:
-
-1. Add explicit event-based alert models such as `OFFLINE`.
-2. Extract and honor `notify_via` values such as SMS/PUSH instead of defaulting to EMAIL.
-3. Add stronger malformed-LLM-output recovery and retry/fallback behavior.
-4. Add structured logging and request IDs.
-5. Add more comprehensive parser tests and fuzz/edge-case tests.
-6. Replace the in-memory store with a persistent database.
-7. Add authentication and authorization.
-8. Add prompt-injection defenses.
-9. Add model/configuration through environment variables.
-10. Add CI to run tests automatically.
-
-The core architecture would remain the same: **LLM for language understanding, application code for validation and execution.**
+These are deliberate scope decisions for the current implementation.
 
 ---
 
-## 20. Evaluator Q&A
+## 21. Production / real-time evolution
 
-### Why did you choose Ollama instead of OpenAI?
+The current architecture can be extended into a real-time application without replacing the core design.
 
-The assignment allows a local model, and this task does not require a large cloud model. Ollama keeps the complete system local, removes API-key and billing dependencies, improves reproducibility for evaluation, and avoids sending facility commands to an external service.
+### Real-time data layer
 
-### Why use a hybrid approach?
+Replace deterministic mock sensor values with:
 
-Because the responsibilities are fundamentally different.
+```text
+IoT sensors
+   ↓
+MQTT / Kafka / event stream
+   ↓
+Telemetry ingestion service
+   ↓
+Time-series database
+```
 
-Natural-language interpretation benefits from an LLM. Device existence, metric compatibility, schema validation, safety decisions, and execution should be deterministic.
+Examples of production storage could include PostgreSQL/TimescaleDB, InfluxDB, or another telemetry store.
 
-This makes the system more predictable and prevents a plausible-looking LLM response from becoming an unchecked backend action.
+### Alert evaluation
+
+Instead of simply storing alert rules, introduce a rule engine:
+
+```text
+Incoming sensor reading
+        ↓
+Find rules for asset + parameter
+        ↓
+Evaluate condition
+        ↓
+Check duration/window
+        ↓
+Trigger notification
+```
+
+### Persistent storage
+
+Replace the in-memory rule store with a database so rules survive application restarts.
+
+### Notifications
+
+Connect the notification layer to real:
+
+```text
+EMAIL
+SMS
+PUSH
+```
+
+providers.
+
+### API and security
+
+Add:
+
+- Authentication
+- Authorization
+- Tenant isolation
+- Rate limiting
+- Structured logging
+- Request IDs
+- Audit logs
+
+### LLM layer
+
+The LLM should remain at the language boundary.
+
+The production principle should still be:
+
+```text
+LLM
+ ↓
+Candidate action
+ ↓
+Deterministic resolver
+ ↓
+Deterministic validator
+ ↓
+Rule engine / execution
+```
+
+The LLM should never directly control a physical device.
+
+---
+
+## 22. Optimization opportunities
+
+The next optimization areas would be:
+
+### 1. Improve extraction accuracy
+
+Use:
+
+- tighter structured prompts
+- few-shot examples for difficult phrasing
+- schema-constrained generation
+- deterministic fallback extraction
+- confidence/ambiguity handling
+
+### 2. Reduce token usage
+
+Avoid repeatedly sending unnecessarily large registry descriptions.
+
+A production design could retrieve only the relevant asset's schema:
+
+```text
+User mentions tipper-101
+        ↓
+Retrieve tipper-101 schema
+        ↓
+Send only relevant parameters to LLM
+```
+
+This reduces prompt size and improves scalability.
+
+### 3. Reduce LLM calls
+
+The deterministic router already prevents unnecessary high-level classification calls.
+
+Further optimization could combine extraction operations where practical and use deterministic parsing for highly predictable fields.
+
+---
+
+## 23. Evaluator Q&A
+
+### Why did you choose Ollama?
+
+The assignment allows local inference, and this task does not require a cloud model. Ollama keeps inference local, removes API-key and billing dependencies, improves reproducibility, and avoids sending facility commands to an external service.
 
 ### Why Llama 3.2?
 
-The extraction task is relatively narrow. It does not require complex multi-step reasoning or a large frontier model.
+The task is primarily structured extraction rather than deep reasoning. Llama 3.2 is lightweight enough for local inference while being capable of extracting the fields needed by the application.
 
-Llama 3.2 is small enough for local inference while being capable of extracting the structured fields required by this application. It is also directly available through Ollama.
+### Why a hybrid architecture?
 
-### Why not use the LLM for intent routing too?
+Language understanding is probabilistic, while device existence, parameter compatibility, safety, and execution should be deterministic.
 
-The intent space is small and stable:
+The LLM translates the request. The application decides whether the resulting action is valid.
 
-```text
-CREATE_ALERT_RULE
-QUERY_STATUS
-LIST_RULES
-UNSUPPORTED
-```
+### Why not use the LLM for intent routing?
 
-A deterministic router is easier to test and makes obvious safety boundaries predictable. The LLM is then used where it provides the most value: interpreting the parameters inside a known intent.
+The intent space is small and stable. A deterministic router is cheaper, faster, easier to test, and more predictable.
 
 ### What happens if the LLM hallucinates a device?
 
-The action does not get trusted automatically.
+The extracted action is checked against the registry. If the device does not exist, validation fails and the action is not executed.
 
-The validator checks the device against `DEVICE_REGISTRY`. An unknown device produces an HTTP 422 validation error.
+### What happens if a parameter is ambiguous?
 
-### What happens if the LLM returns an unsupported metric?
+The resolver returns all matching parameters. The system rejects the action and asks the user to specify the intended parameter.
 
-The validator checks the metric against the selected device's supported metrics and rejects the action.
+### What happens if the parameter is unknown?
+
+The resolver returns `UNKNOWN`, and the action is rejected before execution.
 
 ### Why not execute camera-offline alerts?
 
-The current alert schema is numeric-threshold based. A camera going offline is a state/event condition rather than `ABOVE`, `BELOW`, or `EQUALS` with a numeric threshold.
-
-The system therefore safely returns `UNSUPPORTED` rather than pretending the backend can execute an action it does not model.
+The current alert schema models numeric thresholds. `OFFLINE` is an event/state condition, so the system safely returns `UNSUPPORTED` rather than pretending the backend supports it.
 
 ### Why use Pydantic?
 
-Pydantic gives the application explicit typed boundaries between untrusted model output and application logic. It makes malformed or incomplete structured output fail early instead of flowing into execution.
+Pydantic provides typed boundaries between model output and application logic. It makes malformed or incomplete structured output fail early.
 
-### Why an in-memory store?
+### Why use an in-memory store?
 
-The assignment explicitly says that no real database is required. An in-memory list demonstrates the required create-and-query behavior without introducing unnecessary infrastructure.
+The assignment does not require a real database. An in-memory store demonstrates the create-and-query workflow without unnecessary infrastructure.
 
 ### What is the most important architectural decision?
 
 The most important decision is **not allowing the LLM to be the final authority**.
 
-The LLM translates language into a candidate action. The application decides whether that action is valid and executable.
-
-That distinction is what makes the system an action service rather than simply an LLM that generates JSON.
+The LLM produces a candidate action. The application owns validation and execution.
 
 ---
 
-## 21. Summary
+## 24. Summary
 
-This project demonstrates a compact but safety-conscious natural-language action pipeline:
+This project demonstrates a compact, safety-conscious natural-language action pipeline:
 
 ```text
 Human language
@@ -931,13 +1103,15 @@ Deterministic intent routing
       ↓
 Local LLM extraction
       ↓
-Pydantic structured action
+Typed Action / ActionPlan
       ↓
-Registry validation
+Asset + parameter resolution
       ↓
-Deterministic execution
+Deterministic validation
       ↓
-Mock backend / clear rejection
+Execution
+      ↓
+Mock backend / safe rejection
 ```
 
 The key engineering trade-off is intentional:
