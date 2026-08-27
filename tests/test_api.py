@@ -6,10 +6,9 @@ from app.models import (
     CreateAlertRule,
     ListRules,
     QueryStatus,
-    Unsupported,
 )
-from app.service import process_command
 from app.store import RULE_STORE, clear_rules
+from app.service import process_command as app_service_process
 
 
 client = TestClient(app)
@@ -27,11 +26,6 @@ def teardown_function():
     Reset the in-memory rule store after every test.
     """
     clear_rules()
-
-
-# ---------------------------------------------------------------------------
-# Existing API tests
-# ---------------------------------------------------------------------------
 
 
 def test_root_endpoint():
@@ -81,22 +75,15 @@ def test_create_alert_command(monkeypatch):
     """
 
     def fake_process_command(text: str):
-        action = CreateAlertRule(
-            device_id="warehouse-3",
-            metric="temperature",
-            condition="ABOVE",
-            threshold=40,
-            duration_minutes=10,
-            notify_via=["EMAIL"],
-        )
-
         return {
-            "action": action.model_dump(),
-            "result": {
-                "success": True,
-                "message": "Alert rule created successfully.",
-                "rule": action.model_dump(),
-            },
+            "success": True,
+            "message": "Alert rule created successfully.",
+            "device_id": "warehouse-3",
+            "metric": "temperature",
+            "condition": "ABOVE",
+            "threshold": 40,
+            "duration_minutes": 10,
+            "current_value": 36.5,
         }
 
     monkeypatch.setattr(
@@ -119,12 +106,13 @@ def test_create_alert_command(monkeypatch):
     data = response.json()
 
     assert data["success"] is True
-    assert data["action"]["type"] == "CREATE_ALERT_RULE"
-    assert data["action"]["device_id"] == "warehouse-3"
-    assert data["action"]["metric"] == "temperature"
-    assert data["action"]["condition"] == "ABOVE"
-    assert data["action"]["threshold"] == 40
-    assert data["action"]["duration_minutes"] == 10
+    assert data["message"] == "Alert rule created successfully."
+    assert data["device_id"] == "warehouse-3"
+    assert data["metric"] == "temperature"
+    assert data["condition"] == "ABOVE"
+    assert data["threshold"] == 40
+    assert data["duration_minutes"] == 10
+    assert data["current_value"] == 36.5
 
 
 def test_query_status_command(monkeypatch):
@@ -133,19 +121,12 @@ def test_query_status_command(monkeypatch):
     """
 
     def fake_process_command(text: str):
-        action = QueryStatus(
-            device_id="cold-storage-1",
-            metric="humidity",
-        )
-
         return {
-            "action": action.model_dump(),
-            "result": {
-                "success": True,
-                "device_id": "cold-storage-1",
-                "metric": "humidity",
-                "value": 71.0,
-            },
+            "success": True,
+            "message": "Current value retrieved successfully.",
+            "device_id": "cold-storage-1",
+            "metric": "humidity",
+            "current_value": 71.0,
         }
 
     monkeypatch.setattr(
@@ -165,33 +146,25 @@ def test_query_status_command(monkeypatch):
     data = response.json()
 
     assert data["success"] is True
-    assert data["action"]["type"] == "QUERY_STATUS"
-    assert data["action"]["device_id"] == "cold-storage-1"
-    assert data["action"]["metric"] == "humidity"
-    assert data["result"]["value"] == 71.0
+    assert data["message"] == "Current value retrieved successfully."
+    assert data["device_id"] == "cold-storage-1"
+    assert data["metric"] == "humidity"
+    assert data["current_value"] == 71.0
 
 
 def test_unsupported_command(monkeypatch):
     """
-    Unsupported operations should be handled safely without
-    attempting physical device control.
+    Unsupported operations should be reported as unsuccessful
+    user requests while still returning HTTP 200.
     """
 
     def fake_process_command(text: str):
-        action = Unsupported(
-            reason=(
+        return {
+            "success": False,
+            "message": (
                 "System does not directly control physical devices "
                 "or equipment."
-            )
-        )
-
-        return {
-            "action": action.model_dump(),
-            "result": {
-                "success": False,
-                "message": "Unsupported request.",
-                "reason": action.reason,
-            },
+            ),
         }
 
     monkeypatch.setattr(
@@ -210,9 +183,11 @@ def test_unsupported_command(monkeypatch):
 
     data = response.json()
 
-    assert data["success"] is True
-    assert data["action"]["type"] == "UNSUPPORTED"
-    assert data["result"]["success"] is False
+    assert data["success"] is False
+    assert data["message"] == (
+        "System does not directly control physical devices "
+        "or equipment."
+    )
 
 
 def test_validation_error():
@@ -339,21 +314,13 @@ def test_front_gate_camera_is_unsupported(monkeypatch):
     """
 
     def fake_process_command(text: str):
-        action = Unsupported(
-            reason=(
+        return {
+            "success": False,
+            "message": (
                 "Event-based alert conditions such as camera "
                 "offline are not currently supported. "
                 "Alert rules require a numeric threshold."
-            )
-        )
-
-        return {
-            "action": action.model_dump(),
-            "result": {
-                "success": False,
-                "message": "Unsupported request.",
-                "reason": action.reason,
-            },
+            ),
         }
 
     monkeypatch.setattr(
@@ -375,20 +342,18 @@ def test_front_gate_camera_is_unsupported(monkeypatch):
 
     data = response.json()
 
-    assert data["success"] is True
-    assert data["action"]["type"] == "UNSUPPORTED"
-    assert data["result"]["success"] is False
-
-
-# ---------------------------------------------------------------------------
-# Multi-action tests
-# ---------------------------------------------------------------------------
+    assert data["success"] is False
+    assert data["message"] == (
+        "Event-based alert conditions such as camera "
+        "offline are not currently supported. "
+        "Alert rules require a numeric threshold."
+    )
 
 
 def test_multi_action_multiple_status_queries(monkeypatch):
     """
     Multiple explicitly requested metrics should become separate
-    QUERY_STATUS actions and execute independently.
+    QUERY_STATUS actions and return clean user-facing results.
     """
 
     plan = ActionPlan(
@@ -409,28 +374,25 @@ def test_multi_action_multiple_status_queries(monkeypatch):
         lambda text: plan,
     )
 
-    result = process_command(
+    result = app_service_process(
         "what is the temperature and humidity in warehouse-3"
     )
 
     assert result["success"] is True
-    assert result["action_count"] == 2
-    assert len(result["actions"]) == 2
+    assert len(result["results"]) == 2
 
-    first = result["actions"][0]
-    second = result["actions"][1]
+    first = result["results"][0]
+    second = result["results"][1]
 
     assert first["success"] is True
-    assert first["action"]["type"] == "QUERY_STATUS"
-    assert first["action"]["device_id"] == "warehouse-3"
-    assert first["action"]["metric"] == "temperature"
-    assert first["result"]["value"] == 36.5
+    assert first["device_id"] == "warehouse-3"
+    assert first["metric"] == "temperature"
+    assert first["current_value"] == 36.5
 
     assert second["success"] is True
-    assert second["action"]["type"] == "QUERY_STATUS"
-    assert second["action"]["device_id"] == "warehouse-3"
-    assert second["action"]["metric"] == "humidity"
-    assert second["result"]["value"] == 58.0
+    assert second["device_id"] == "warehouse-3"
+    assert second["metric"] == "humidity"
+    assert second["current_value"] == 58.0
 
 
 def test_multi_action_mixed_intents(monkeypatch):
@@ -455,33 +417,32 @@ def test_multi_action_mixed_intents(monkeypatch):
         lambda text: plan,
     )
 
-    result = process_command(
+    result = app_service_process(
         "check the temperature of warehouse-3 "
         "and show me its alert rules"
     )
 
     assert result["success"] is True
-    assert result["action_count"] == 2
-    assert len(result["actions"]) == 2
+    assert len(result["results"]) == 2
 
-    first = result["actions"][0]
-    second = result["actions"][1]
+    status_result = result["results"][0]
+    rules_result = result["results"][1]
 
-    assert first["success"] is True
-    assert first["action"]["type"] == "QUERY_STATUS"
-    assert first["action"]["metric"] == "temperature"
-    assert first["result"]["value"] == 36.5
+    assert status_result["success"] is True
+    assert status_result["device_id"] == "warehouse-3"
+    assert status_result["metric"] == "temperature"
+    assert status_result["current_value"] == 36.5
 
-    assert second["success"] is True
-    assert second["action"]["type"] == "LIST_RULES"
-    assert second["action"]["device_id"] == "warehouse-3"
-    assert second["result"]["count"] == 0
+    assert rules_result["success"] is True
+    assert rules_result["device_id"] == "warehouse-3"
+    assert rules_result["count"] == 0
+    assert rules_result["rules"] == []
 
 
 def test_multi_action_multiple_alert_rules(monkeypatch):
     """
     Multiple explicitly requested alert rules should be created
-    independently.
+    independently and return clean results.
     """
 
     plan = ActionPlan(
@@ -510,33 +471,30 @@ def test_multi_action_multiple_alert_rules(monkeypatch):
         lambda text: plan,
     )
 
-    result = process_command(
+    result = app_service_process(
         "create a temperature alert for warehouse-3 above 40 "
         "and a humidity alert for warehouse-3 below 30"
     )
 
     assert result["success"] is True
-    assert result["action_count"] == 2
-    assert len(result["actions"]) == 2
+    assert len(result["results"]) == 2
 
-    assert len(RULE_STORE) == 2
+    temperature_result = result["results"][0]
+    humidity_result = result["results"][1]
 
-    first = result["actions"][0]
-    second = result["actions"][1]
+    assert temperature_result["success"] is True
+    assert temperature_result["device_id"] == "warehouse-3"
+    assert temperature_result["metric"] == "temperature"
+    assert temperature_result["condition"] == "ABOVE"
+    assert temperature_result["threshold"] == 40
+    assert temperature_result["current_value"] == 36.5
 
-    assert first["success"] is True
-    assert first["action"]["type"] == "CREATE_ALERT_RULE"
-    assert first["action"]["device_id"] == "warehouse-3"
-    assert first["action"]["metric"] == "temperature"
-    assert first["action"]["condition"] == "ABOVE"
-    assert first["action"]["threshold"] == 40.0
-
-    assert second["success"] is True
-    assert second["action"]["type"] == "CREATE_ALERT_RULE"
-    assert second["action"]["device_id"] == "warehouse-3"
-    assert second["action"]["metric"] == "humidity"
-    assert second["action"]["condition"] == "BELOW"
-    assert second["action"]["threshold"] == 30.0
+    assert humidity_result["success"] is True
+    assert humidity_result["device_id"] == "warehouse-3"
+    assert humidity_result["metric"] == "humidity"
+    assert humidity_result["condition"] == "BELOW"
+    assert humidity_result["threshold"] == 30
+    assert humidity_result["current_value"] == 58.0
 
 
 def test_multi_action_ambiguous_parameter_is_rejected(monkeypatch):
@@ -563,30 +521,26 @@ def test_multi_action_ambiguous_parameter_is_rejected(monkeypatch):
         lambda text: plan,
     )
 
-    result = process_command(
+    result = app_service_process(
         "what is the temperature in warehouse-3 "
         "and the temperature in tipper-101"
     )
 
     assert result["success"] is False
-    assert result["action_count"] == 2
-    assert len(result["actions"]) == 2
+    assert len(result["results"]) == 2
 
-    valid_action = result["actions"][0]
-    invalid_action = result["actions"][1]
+    valid_result = result["results"][0]
+    failed_result = result["results"][1]
 
-    assert valid_action["success"] is True
-    assert valid_action["action"]["device_id"] == "warehouse-3"
-    assert valid_action["action"]["metric"] == "temperature"
-    assert valid_action["result"]["value"] == 36.5
+    assert valid_result["success"] is True
+    assert valid_result["device_id"] == "warehouse-3"
+    assert valid_result["metric"] == "temperature"
+    assert valid_result["current_value"] == 36.5
 
-    assert invalid_action["success"] is False
-    assert invalid_action["action"]["device_id"] == "tipper-101"
-    assert invalid_action["action"]["metric"] == "temperature"
-    assert "Multiple parameters match" in invalid_action["error"]
-    assert "hydraulic_temperature" in invalid_action["error"]
-    assert "engine_temperature" in invalid_action["error"]
-    assert "oil_temperature" in invalid_action["error"]
+    assert failed_result["success"] is False
+    assert failed_result["device_id"] == "tipper-101"
+    assert failed_result["metric"] == "temperature"
+    assert "Multiple parameters match" in failed_result["message"]
 
 
 def test_multi_action_unknown_parameter_is_rejected(monkeypatch):
@@ -613,25 +567,164 @@ def test_multi_action_unknown_parameter_is_rejected(monkeypatch):
         lambda text: plan,
     )
 
-    result = process_command(
+    result = app_service_process(
         "what is the temperature in warehouse-3 "
         "and the battery voltage in tipper-101"
     )
 
     assert result["success"] is False
-    assert result["action_count"] == 2
-    assert len(result["actions"]) == 2
+    assert len(result["results"]) == 2
 
-    valid_action = result["actions"][0]
-    invalid_action = result["actions"][1]
+    valid_result = result["results"][0]
+    failed_result = result["results"][1]
 
-    assert valid_action["success"] is True
-    assert valid_action["action"]["device_id"] == "warehouse-3"
-    assert valid_action["action"]["metric"] == "temperature"
-    assert valid_action["result"]["value"] == 36.5
+    assert valid_result["success"] is True
+    assert valid_result["device_id"] == "warehouse-3"
+    assert valid_result["metric"] == "temperature"
+    assert valid_result["current_value"] == 36.5
 
-    assert invalid_action["success"] is False
-    assert invalid_action["action"]["device_id"] == "tipper-101"
-    assert invalid_action["action"]["metric"] == "battery_voltage"
-    assert "battery_voltage" in invalid_action["error"]
-    assert "not registered" in invalid_action["error"]
+    assert failed_result["success"] is False
+    assert failed_result["device_id"] == "tipper-101"
+    assert failed_result["metric"] == "battery_voltage"
+    assert "not registered" in failed_result["message"]
+
+
+def test_multi_asset_same_intent(monkeypatch):
+    """
+    The same intent can target different assets.
+    """
+
+    plan = ActionPlan(
+        actions=[
+            QueryStatus(
+                device_id="warehouse-3",
+                metric="temperature",
+            ),
+            QueryStatus(
+                device_id="tipper-101",
+                metric="hydraulic_temperature",
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "app.service.extract_action_plan",
+        lambda text: plan,
+    )
+
+    result = app_service_process(
+        "what is the temperature in warehouse-3 and "
+        "the hydraulic temperature in tipper-101"
+    )
+
+    assert result["success"] is True
+    assert len(result["results"]) == 2
+
+    assert result["results"][0]["device_id"] == "warehouse-3"
+    assert result["results"][0]["current_value"] == 36.5
+
+    assert result["results"][1]["device_id"] == "tipper-101"
+    assert result["results"][1]["metric"] == "hydraulic_temperature"
+    assert result["results"][1]["current_value"] == 72.5
+
+
+def test_multi_asset_mixed_intents(monkeypatch):
+    """
+    Different intents can target different assets.
+    """
+
+    plan = ActionPlan(
+        actions=[
+            CreateAlertRule(
+                device_id="warehouse-3",
+                metric="temperature",
+                condition="ABOVE",
+                threshold=400,
+                duration_minutes=0,
+                notify_via=["EMAIL"],
+            ),
+            QueryStatus(
+                device_id="tipper-101",
+                metric="hydraulic_pressure",
+            ),
+            ListRules(
+                device_id="cold-storage-1",
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "app.service.extract_action_plan",
+        lambda text: plan,
+    )
+
+    result = app_service_process(
+        "alert warehouse-3 if temperature goes above 400, "
+        "check hydraulic pressure of tipper-101, "
+        "and show alert rules for cold-storage-1"
+    )
+
+    assert result["success"] is True
+    assert len(result["results"]) == 3
+
+    alert_result = result["results"][0]
+    pressure_result = result["results"][1]
+    rules_result = result["results"][2]
+
+    assert alert_result["success"] is True
+    assert alert_result["device_id"] == "warehouse-3"
+    assert alert_result["metric"] == "temperature"
+    assert alert_result["threshold"] == 400
+    assert alert_result["current_value"] == 36.5
+
+    assert pressure_result["success"] is True
+    assert pressure_result["device_id"] == "tipper-101"
+    assert pressure_result["metric"] == "hydraulic_pressure"
+    assert pressure_result["current_value"] == 185.0
+
+    assert rules_result["success"] is True
+    assert rules_result["device_id"] == "cold-storage-1"
+    assert rules_result["count"] == 0
+
+
+def test_multi_asset_partial_failure(monkeypatch):
+    """
+    One invalid action should not prevent valid actions on other
+    assets from executing.
+    """
+
+    plan = ActionPlan(
+        actions=[
+            QueryStatus(
+                device_id="warehouse-3",
+                metric="temperature",
+            ),
+            QueryStatus(
+                device_id="tipper-101",
+                metric="temperature",
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "app.service.extract_action_plan",
+        lambda text: plan,
+    )
+
+    result = app_service_process(
+        "what is the temperature of warehouse-3 "
+        "and the temperature of tipper-101"
+    )
+
+    assert result["success"] is False
+    assert len(result["results"]) == 2
+
+    assert result["results"][0]["success"] is True
+    assert result["results"][0]["device_id"] == "warehouse-3"
+    assert result["results"][0]["current_value"] == 36.5
+
+    assert result["results"][1]["success"] is False
+    assert result["results"][1]["device_id"] == "tipper-101"
+    assert "Multiple parameters match" in (
+        result["results"][1]["message"]
+    )

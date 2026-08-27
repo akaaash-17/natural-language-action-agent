@@ -83,8 +83,6 @@ def _build_action_from_single_intent(
     """
     Build one action from the existing single-intent extraction
     pipeline.
-
-    This preserves the original single-action behavior.
     """
 
     if intent == "CREATE_ALERT_RULE":
@@ -155,8 +153,7 @@ def _resolve_action(action):
     Resolve an already parsed action against the asset/parameter
     registry.
 
-    This is used by the multi-action pipeline because the LLM has
-    already produced a typed action.
+    Used by the multi-action pipeline.
     """
 
     if isinstance(action, CreateAlertRule):
@@ -188,6 +185,125 @@ def _resolve_action(action):
     return action
 
 
+def _format_single_result(
+    action,
+    result: dict,
+) -> dict:
+    """
+    Convert an internal action/executor result into a clean,
+    user-facing response.
+
+    Internal action types are intentionally hidden from the
+    API response.
+    """
+
+    if isinstance(action, CreateAlertRule):
+        current_value = None
+
+        # Retrieve the current sensor value so the user gets
+        # immediate context after creating the alert.
+        try:
+            current_status = execute_action(
+                QueryStatus(
+                    device_id=action.device_id,
+                    metric=action.metric,
+                )
+            )
+
+            current_value = current_status.get("value")
+
+        except Exception:
+            # Alert creation itself succeeded, so failure to
+            # retrieve current status should not invalidate it.
+            current_value = None
+
+        response = {
+            "success": True,
+            "message": "Alert rule created successfully.",
+            "device_id": action.device_id,
+            "metric": action.metric,
+            "condition": action.condition,
+            "threshold": action.threshold,
+            "duration_minutes": action.duration_minutes,
+            "current_value": current_value,
+        }
+
+        return response
+
+    if isinstance(action, QueryStatus):
+        return {
+            "success": True,
+            "message": "Current value retrieved successfully.",
+            "device_id": action.device_id,
+            "metric": action.metric,
+            "current_value": result.get("value"),
+        }
+
+    if isinstance(action, ListRules):
+        return {
+            "success": True,
+            "message": "Alert rules retrieved successfully.",
+            "device_id": action.device_id,
+            "count": result.get("count", 0),
+            "rules": result.get("rules", []),
+        }
+
+    if isinstance(action, Unsupported):
+        return {
+            "success": False,
+            "message": result.get(
+                "reason",
+                action.reason,
+            ),
+        }
+
+    return {
+        "success": False,
+        "message": "Unable to format the action result.",
+    }
+
+
+def _format_multi_result(results: list) -> dict:
+    """
+    Convert internal multi-action results into a clean,
+    user-facing response.
+    """
+
+    formatted_results = []
+
+    for item in results:
+        action = item.get("_action")
+
+        if item["success"]:
+            formatted = _format_single_result(
+                action=action,
+                result=item["result"],
+            )
+
+        else:
+            formatted = {
+                "success": False,
+                "message": item["error"],
+            }
+
+            # Include asset context when available.
+            if hasattr(action, "device_id"):
+                formatted["device_id"] = action.device_id
+
+            if hasattr(action, "metric"):
+                formatted["metric"] = action.metric
+
+        formatted_results.append(formatted)
+
+    return {
+        "success": all(
+            item["success"]
+            for item in formatted_results
+        ),
+        "results": formatted_results,
+    }
+
+
 def _process_multi_action(text: str) -> dict:
     """
     Parse, resolve, validate, and execute every action contained
@@ -215,7 +331,7 @@ def _process_multi_action(text: str) -> dict:
             results.append(
                 {
                     "success": True,
-                    "action": resolved_action.model_dump(),
+                    "_action": resolved_action,
                     "result": result,
                 }
             )
@@ -224,50 +340,33 @@ def _process_multi_action(text: str) -> dict:
             results.append(
                 {
                     "success": False,
-                    "action": action.model_dump(),
+                    "_action": action,
                     "error": str(exc),
                 }
             )
 
-        except Exception as exc:
+        except Exception:
             results.append(
                 {
                     "success": False,
-                    "action": action.model_dump(),
+                    "_action": action,
                     "error": (
                         "Unexpected error while processing "
                         "this action."
                     ),
-                    "detail": str(exc),
                 }
             )
 
-    overall_success = all(
-        item["success"]
-        for item in results
-    )
-
-    return {
-        "success": overall_success,
-        "action_count": len(results),
-        "actions": results,
-    }
+    return _format_multi_result(results)
 
 
 def process_command(text: str) -> dict:
     """
-    Convert a natural-language command into validated action(s)
-    and execute them against the mock backend.
+    Convert a natural-language command into validated action(s),
+    execute them, and return a clean user-facing response.
 
-    Single-action requests use the existing deterministic pipeline.
-
-    Multi-action requests are decomposed into an ActionPlan and
-    each action independently passes through:
-
-        resolver -> validator -> executor
-
-    This ensures that one invalid action does not prevent other
-    independent actions from being evaluated.
+    Internal action representations are intentionally kept out
+    of the API response.
     """
 
     intent = route_intent(text)
@@ -288,7 +387,7 @@ def process_command(text: str) -> dict:
     # Only validated actions reach the executor.
     result = execute_action(action)
 
-    return {
-        "action": action.model_dump(),
-        "result": result,
-    }
+    return _format_single_result(
+        action=action,
+        result=result,
+    )
